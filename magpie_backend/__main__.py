@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -7,12 +8,18 @@ import time
 from typing import Any, Dict, Optional
 
 
-def _send(obj: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+def _send(stream: io.TextIOBase, obj: Dict[str, Any]) -> None:
+    stream.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    stream.flush()
 
 
-def _log(session_id: str, level: str, message: str, in_reply_to: Optional[str] = None) -> None:
+def _log(
+    stream: io.TextIOBase,
+    session_id: str,
+    level: str,
+    message: str,
+    in_reply_to: Optional[str] = None,
+) -> None:
     payload: Dict[str, Any] = {
         "type": "log",
         "session_id": session_id,
@@ -21,23 +28,23 @@ def _log(session_id: str, level: str, message: str, in_reply_to: Optional[str] =
     }
     if in_reply_to is not None:
         payload["in_reply_to"] = in_reply_to
-    _send(payload)
+    _send(stream, payload)
 
 
-def main() -> int:
-    session_id = os.environ.get("MAGPIE_SESSION_ID", "unknown")
-    fixtures = os.environ.get("MAGPIE_USE_FIXTURES") == "1"
+def run(stdin: io.TextIOBase, stdout: io.TextIOBase, env: dict[str, str]) -> int:
+    session_id = env.get("MAGPIE_SESSION_ID", "unknown")
+    fixtures = env.get("MAGPIE_USE_FIXTURES") == "1"
 
-    _log(session_id, "info", "backend booted")
+    _log(stdout, session_id, "info", "backend booted")
 
-    for raw in sys.stdin:
+    for raw in stdin:
         line = raw.strip()
         if not line:
             continue
         try:
             msg = json.loads(line)
         except Exception as e:  # noqa: BLE001
-            _log(session_id, "warn", f"failed to parse JSON: {e} :: {line[:200]}")
+            _log(stdout, session_id, "warn", f"failed to parse JSON: {e} :: {line[:200]}")
             continue
 
         session_id = str(msg.get("session_id") or session_id)
@@ -46,6 +53,7 @@ def main() -> int:
 
         if mtype == "hello":
             _send(
+                stdout,
                 {
                     "type": "hello_ack",
                     "session_id": session_id,
@@ -59,12 +67,13 @@ def main() -> int:
                     },
                 }
             )
-            _log(session_id, "info", "hello_ack sent", in_reply_to=request_id)
+            _log(stdout, session_id, "info", "hello_ack sent", in_reply_to=request_id)
             continue
 
         if mtype == "cancel":
-            _log(session_id, "info", "cancel received", in_reply_to=request_id)
+            _log(stdout, session_id, "info", "cancel received", in_reply_to=request_id)
             _send(
+                stdout,
                 {
                     "type": "done",
                     "session_id": session_id,
@@ -73,16 +82,29 @@ def main() -> int:
                     "canceled": True,
                 }
             )
-            _send({"type": "phase", "session_id": session_id, "name": "idle", "in_reply_to": request_id})
+            _send(
+                stdout,
+                {"type": "phase", "session_id": session_id, "name": "idle", "in_reply_to": request_id},
+            )
             continue
 
         if mtype == "start":
             query = str(msg.get("query") or "")
-            _send({"type": "phase", "session_id": session_id, "name": "rag", "in_reply_to": request_id})
-            _log(session_id, "info", f"received query: {query}", in_reply_to=request_id)
-            time.sleep(0.1)
-            _log(session_id, "info", "M0 demo: no-op pipeline (RAG/SEARCH/GENERATE to be added in later milestones)", in_reply_to=request_id)
             _send(
+                stdout,
+                {"type": "phase", "session_id": session_id, "name": "rag", "in_reply_to": request_id},
+            )
+            _log(stdout, session_id, "info", f"received query: {query}", in_reply_to=request_id)
+            time.sleep(0.1)
+            _log(
+                stdout,
+                session_id,
+                "info",
+                "M0 demo: no-op pipeline (RAG/SEARCH/GENERATE to be added in later milestones)",
+                in_reply_to=request_id,
+            )
+            _send(
+                stdout,
                 {
                     "type": "done",
                     "session_id": session_id,
@@ -91,15 +113,21 @@ def main() -> int:
                     "canceled": False,
                 }
             )
-            _send({"type": "phase", "session_id": session_id, "name": "idle", "in_reply_to": request_id})
+            _send(
+                stdout,
+                {"type": "phase", "session_id": session_id, "name": "idle", "in_reply_to": request_id},
+            )
             continue
 
-        _log(session_id, "warn", f"unknown message type: {mtype}", in_reply_to=request_id)
+        _log(stdout, session_id, "warn", f"unknown message type: {mtype}", in_reply_to=request_id)
 
-    _log(session_id, "info", "stdin closed; exiting")
+    _log(stdout, session_id, "info", "stdin closed; exiting")
     return 0
+
+
+def main() -> int:
+    return run(sys.stdin, sys.stdout, dict(os.environ))
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

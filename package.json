@@ -10,7 +10,14 @@
     "dev": "node --import tsx src/cli.tsx",
     "build": "tsup src/cli.tsx --format esm --platform node --target es2022 --out-dir dist --sourcemap",
     "start": "node bin/magpie.js",
-    "smoke:ipc": "node scripts/smoke-ipc.js"
+    "smoke:ipc": "node scripts/smoke-ipc.js",
+    "typecheck": "./node_modules/.bin/tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test",
+    "test:cov": "node --import tsx --test --experimental-test-coverage --test-coverage-include=src/ipc/** --test-coverage-exclude=test/**",
+    "py:test": "python3 -m unittest discover -s magpie_backend/tests -p 'test_*.py' -v",
+    "py:cov": "python3 scripts/py_coverage.py",
+    "coverage:baseline": "node scripts/update-coverage-baseline.mjs",
+    "gate": "node scripts/quality-gate.mjs"
   },
   "dependencies": {
     "ink": "^4.4.1",

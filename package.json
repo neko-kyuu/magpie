@@ -1,0 +1,26 @@
+{
+  "name": "magpie-cli",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "bin": {
+    "magpie": "bin/magpie.js"
+  },
+  "scripts": {
+    "dev": "node --import tsx src/cli.tsx",
+    "build": "tsup src/cli.tsx --format esm --platform node --target es2022 --out-dir dist --sourcemap",
+    "start": "node bin/magpie.js",
+    "smoke:ipc": "node scripts/smoke-ipc.js"
+  },
+  "dependencies": {
+    "ink": "^4.4.1",
+    "react": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/react": "^18.2.66",
+    "tsup": "^8.0.2",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.3"
+  }
+}

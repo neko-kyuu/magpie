@@ -1,0 +1,9 @@
+[project]
+name = "magpie-backend"
+version = "0.0.0"
+description = "Magpie CLI demo backend (M0)"
+requires-python = ">=3.9"
+
+[tool.uv]
+dev-dependencies = []
+

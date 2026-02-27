@@ -4,7 +4,20 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, Static } from "ink";
 
 import type { BackendClient } from "../ipc/backendClient";
-import type { Permission, PhaseName, ServerMessage } from "../ipc/protocol";
+import type { Item, Permission, PhaseName, ServerMessage } from "../ipc/protocol";
+import {
+  RESULTS_GROUPS,
+  cycleGroup,
+  exitHistoryBrowse,
+  firstNonEmptyGroup,
+  historyDown,
+  historyUp,
+  initialHistoryState,
+  normalizeSelection,
+  pushHistory,
+  wrapSelection,
+  type ResultsGroup,
+} from "./focus";
 
 type Props = {
   backend: BackendClient;
@@ -24,6 +37,7 @@ const CLI_BACKGROUND = "#FAF7F6";
 const DOT_DEFAULT = "#2F2F2F";
 const DOT_SUCCESS = "#7B9A77";
 const DOT_ERROR = "#BC7877";
+const DOT_SELECTED = "#00afd7";
 const TEXT_COLOR = "#000000";
 const TEXT_COLOR_DIM = "#9e9b9b";
 
@@ -31,6 +45,15 @@ function normalizeLogMessage(message: string) {
   if (message.startsWith("stderr: ")) return message.slice("stderr: ".length);
   if (message.startsWith("stderr:")) return message.slice("stderr:".length).trimStart();
   return message;
+}
+
+function padCenter(text: string, width: number) {
+  if (width <= 0) return "";
+  if (text.length >= width) return text;
+  const remaining = width - text.length;
+  const left = Math.floor(remaining / 2);
+  const right = remaining - left;
+  return `${" ".repeat(left)}${text}${" ".repeat(right)}`;
 }
 
 function formatMessage(msg: ServerMessage): UiLine[] {
@@ -56,6 +79,17 @@ function formatMessage(msg: ServerMessage): UiLine[] {
     ];
   }
   if (msg.type === "items") {
+    if (msg.group !== "rag") {
+      return [
+        {
+          key: `${Date.now()}-${Math.random()}`,
+          text: `${msg.group} items: ${msg.items.length}`,
+          dotColor: msg.items.length > 0 ? DOT_SUCCESS : DOT_DEFAULT,
+          textColor: msg.items.length > 0 ? "green" : "gray",
+        },
+      ];
+    }
+
     if (msg.items.length === 0) {
       return [
         {
@@ -66,6 +100,7 @@ function formatMessage(msg: ServerMessage): UiLine[] {
         },
       ];
     }
+
     return [
       {
         key: `${Date.now()}-${Math.random()}`,
@@ -73,12 +108,15 @@ function formatMessage(msg: ServerMessage): UiLine[] {
         dotColor: DOT_SUCCESS,
         textColor: "green",
       },
-      ...msg.items.map((item, idx) => ({
-        key: `${Date.now()}-${Math.random()}-${idx}`,
-        text: `${item.clipped ? "★ " : ""}[${item.id}] ${item.title}${item.snippet ? ` — ${item.snippet}` : ""}${item.url ? ` (${item.url})` : ""}`,
-        dotColor: CLI_BACKGROUND,
-        textColor: TEXT_COLOR_DIM,
-      })),
+      ...msg.items.map((item, idx) => {
+        const display = item.group === 'rag' ? item.detail : `${item.snippet ? ` — ${item.snippet}` : ""}${item.url ? ` (${item.url})` : ""}`;
+        return {
+          key: `${Date.now()}-${Math.random()}-${idx}`,
+          text: `[${item.id}] ${item.title}${display}`,
+          dotColor: CLI_BACKGROUND,
+          textColor: TEXT_COLOR_DIM,
+        }
+      }),
     ];
   }
   if (msg.type === "done") {
@@ -126,6 +164,19 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
   const [phase, setPhase] = useState<PhaseName>("idle");
   const [permission] = useState<Permission>(initialPermission);
   const [input, setInput] = useState("");
+  const [focus, setFocus] = useState<"input" | "list">("input");
+  const [activeGroup, setActiveGroup] = useState<ResultsGroup>("web");
+  const [selectedByGroup, setSelectedByGroup] = useState<Record<ResultsGroup, number>>({
+    web: 0,
+    reddit: 0,
+    clips: 0,
+  });
+  const [history, setHistory] = useState(() => initialHistoryState());
+
+  const [ragItems, setRagItems] = useState<Item[]>([]);
+  const [webItems, setWebItems] = useState<Item[]>([]);
+  const [redditItems, setRedditItems] = useState<Item[]>([]);
+  const [clipsItems, setClipsItems] = useState<Item[]>([]);
   const [lines, setLines] = useState<UiLine[]>(() => [
     {
       key: "welcome",
@@ -137,16 +188,53 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
 
   const ctrlCArmedRef = useRef(false);
   const lastStartRequestId = useRef<string | null>(null);
+  const focusRef = useRef(focus);
+  const webLenRef = useRef(0);
+  const redditLenRef = useRef(0);
+
+  useEffect(() => {
+    focusRef.current = focus;
+  }, [focus]);
 
   useEffect(() => {
     const buffered = backend.consumeBufferedMessages();
-    if (buffered.length > 0) {
-      const formatted = buffered.flatMap(formatMessage);
-      setLines((prev) => [...prev, ...formatted].slice(-200));
-    }
-
     const onMessage = (msg: ServerMessage) => {
       if (msg.type === "phase") setPhase(msg.name);
+
+      if (msg.type === "items") {
+        if (msg.group === "rag") {
+          setRagItems(msg.items);
+        } else if (msg.group === "web") {
+          const prevLen = webLenRef.current;
+          const nextLen = msg.items.length;
+          webLenRef.current = nextLen;
+          setWebItems(msg.items);
+          setSelectedByGroup((prev) => ({ ...prev, web: normalizeSelection(prev.web, nextLen) }));
+
+          if (focusRef.current === "input" && prevLen === 0 && nextLen > 0) {
+            setFocus("list");
+            setActiveGroup("web");
+            setSelectedByGroup((prev) => ({ ...prev, web: 0 }));
+          }
+        } else if (msg.group === "reddit") {
+          const prevLen = redditLenRef.current;
+          const nextLen = msg.items.length;
+          redditLenRef.current = nextLen;
+          setRedditItems(msg.items);
+          setSelectedByGroup((prev) => ({ ...prev, reddit: normalizeSelection(prev.reddit, nextLen) }));
+
+          if (focusRef.current === "input" && prevLen === 0 && nextLen > 0) {
+            setFocus("list");
+            setActiveGroup("reddit");
+            setSelectedByGroup((prev) => ({ ...prev, reddit: 0 }));
+          }
+        } else if (msg.group === "clips") {
+          const nextLen = msg.items.length;
+          setClipsItems(msg.items);
+          setSelectedByGroup((prev) => ({ ...prev, clips: normalizeSelection(prev.clips, nextLen) }));
+        }
+      }
+
       const formatted = formatMessage(msg);
       setLines((prev) => [...prev, ...formatted].slice(-200));
       if (msg.type === "done" && msg.in_reply_to === lastStartRequestId.current) {
@@ -154,6 +242,10 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
         ctrlCArmedRef.current = false;
       }
     };
+
+    if (buffered.length > 0) {
+      for (const msg of buffered) onMessage(msg);
+    }
     backend.on("message", onMessage);
     return () => {
       backend.off("message", onMessage);
@@ -164,6 +256,28 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
     return phase === "idle" ? "> " : `${phase}> `;
   }, [phase]);
   const inputLines = input.split(/\r?\n/);
+
+  const resultsByGroup: Record<ResultsGroup, Item[]> = useMemo(
+    () => ({ web: webItems, reddit: redditItems, clips: clipsItems }),
+    [webItems, redditItems, clipsItems]
+  );
+  const groupLengths: Record<ResultsGroup, number> = useMemo(
+    () => ({
+      web: resultsByGroup.web.length,
+      reddit: resultsByGroup.reddit.length,
+      clips: resultsByGroup.clips.length,
+    }),
+    [resultsByGroup]
+  );
+  const activeItems = resultsByGroup[activeGroup];
+  const selectedIndex = normalizeSelection(selectedByGroup[activeGroup], activeItems.length);
+  const groupTabs = useMemo(() => {
+    return RESULTS_GROUPS.map((g) => ({ group: g, label: `${g.toUpperCase()} ${groupLengths[g]}` }));
+  }, [groupLengths]);
+  const tabWidth = useMemo(() => {
+    const max = groupTabs.reduce((acc, t) => Math.max(acc, t.label.length), 0);
+    return Math.max(8, max) + 2;
+  }, [groupTabs]);
 
   useInput((chunk, key) => {
     if (key.ctrl && (chunk === "c" || chunk === "\u0003")) {
@@ -186,6 +300,70 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
       return;
     }
 
+    if (key.tab) {
+      if (focus === "input") {
+        const nextGroup = groupLengths[activeGroup] > 0 ? activeGroup : firstNonEmptyGroup(groupLengths) ?? activeGroup;
+        setActiveGroup(nextGroup);
+        setFocus("list");
+      } else {
+        setFocus("input");
+      }
+      return;
+    }
+
+    if (key.escape) {
+      setFocus("input");
+      setHistory((prev) => exitHistoryBrowse(prev));
+      return;
+    }
+
+    if (focus === "list") {
+      if (key.leftArrow) {
+        setActiveGroup((prev) => cycleGroup(prev, -1));
+        return;
+      }
+      if (key.rightArrow) {
+        setActiveGroup((prev) => cycleGroup(prev, +1));
+        return;
+      }
+      if (key.upArrow) {
+        const len = resultsByGroup[activeGroup].length;
+        setSelectedByGroup((prev) => ({
+          ...prev,
+          [activeGroup]: wrapSelection(prev[activeGroup] ?? 0, -1, len),
+        }));
+        return;
+      }
+      if (key.downArrow) {
+        const len = resultsByGroup[activeGroup].length;
+        setSelectedByGroup((prev) => ({
+          ...prev,
+          [activeGroup]: wrapSelection(prev[activeGroup] ?? 0, +1, len),
+        }));
+        return;
+      }
+      return;
+    }
+
+    if (focus === "input") {
+      if (key.upArrow) {
+        setHistory((prev) => {
+          const res = historyUp(prev, input);
+          setInput(res.value);
+          return res.state;
+        });
+        return;
+      }
+      if (key.downArrow) {
+        setHistory((prev) => {
+          const res = historyDown(prev, input);
+          setInput(res.value);
+          return res.state;
+        });
+        return;
+      }
+    }
+
     const normalized =
       typeof chunk === "string"
         ? chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
@@ -197,14 +375,17 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
       normalized.length > 1;
 
     if (isPasteLike) {
+      setHistory((prev) => exitHistoryBrowse(prev));
       setInput((prev) => prev + normalized);
       return;
     }
 
     if (key.return) {
+      if (focus !== "input") return;
       const trimmed = input.trim();
       if (!trimmed) return;
 
+      setHistory((prev) => pushHistory(exitHistoryBrowse(prev), trimmed));
       setLines((prev) => [
         ...prev,
         {
@@ -223,15 +404,13 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
     }
 
     if (key.backspace || key.delete) {
+      setHistory((prev) => exitHistoryBrowse(prev));
       setInput((prev) => prev.slice(0, -1));
-      return;
-    }
-    if (key.escape) {
-      setInput("");
       return;
     }
 
     if (!key.ctrl && !key.meta && normalized) {
+      setHistory((prev) => exitHistoryBrowse(prev));
       setInput((prev) => prev + normalized);
     }
   });
@@ -259,6 +438,47 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
           </Box>
         )}
       </Static>
+
+      <Box flexDirection="column" marginBottom={1}>
+        <Box>
+          <Text color="gray">results </Text>
+          <Text color={focus === "list" ? "cyan" : "gray"}>focus={focus}</Text>
+        </Box>
+        <Box flexDirection="row">
+          {groupTabs.map((t, idx) => {
+            const isActive = t.group === activeGroup;
+            const bg = isActive ? DOT_SELECTED : "#e9e9e9";
+            const fg = isActive ? "#000000" : "#333333";
+            return (
+              <Box key={t.group} marginRight={idx < groupTabs.length - 1 ? 1 : 0}>
+                <Text backgroundColor={bg} color={fg}>
+                  {padCenter(t.label, tabWidth)}
+                </Text>
+              </Box>
+            );
+          })}
+        </Box>
+
+        <Box flexDirection="column" marginTop={1}>
+          {activeItems.length === 0 ? (
+            <Text color="gray">({activeGroup} has no items)</Text>
+          ) : (
+            activeItems.map((item, idx) => {
+              const isSelected = idx === selectedIndex;
+              const dotColor = focus === "list" && isSelected ? DOT_SELECTED : DOT_DEFAULT;
+              const line = `${item.clipped ? "★ " : ""}[${item.id}] ${item.title}${item.snippet ? ` — ${item.snippet}` : ""}`;
+              return (
+                <Box key={item.id} flexDirection="row" alignItems="flex-start">
+                  <Box width={2} flexShrink={0}>
+                    <Text color={dotColor}>●</Text>
+                  </Box>
+                  <Text color={isSelected ? TEXT_COLOR : TEXT_COLOR_DIM}>{line}</Text>
+                </Box>
+              );
+            })
+          )}
+        </Box>
+      </Box>
 
       <Box flexDirection="column">
         <Box>

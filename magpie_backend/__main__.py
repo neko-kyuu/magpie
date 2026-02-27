@@ -276,7 +276,7 @@ def _call_graphrag_mcp(query: str, env: dict[str, str]) -> tuple[list[Dict[str, 
     items = [_build_rag_item(raw, i) for i, raw in enumerate(raw_items)]
 
     if stderr_text.strip():
-        return items, f"graphrag MCP stderr: {stderr_text.strip()}"
+        return items, f"{stderr_text.strip()}"
     return items, None
 
 

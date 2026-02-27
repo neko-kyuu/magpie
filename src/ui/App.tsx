@@ -20,10 +20,12 @@ type UiLine = {
   userInput?: boolean;
 };
 
+const CLI_BACKGROUND = "#FAF7F6";
 const DOT_DEFAULT = "#2F2F2F";
 const DOT_SUCCESS = "#7B9A77";
 const DOT_ERROR = "#BC7877";
 const TEXT_COLOR = "#000000";
+const TEXT_COLOR_DIM = "#9e9b9b";
 
 function formatMessage(msg: ServerMessage): UiLine[] {
   if (msg.type === "phase") {
@@ -43,7 +45,7 @@ function formatMessage(msg: ServerMessage): UiLine[] {
         key: `${Date.now()}-${Math.random()}`,
         text: msg.message,
         dotColor: isError ? DOT_ERROR : DOT_DEFAULT,
-        textColor: msg.level === "error" ? "red" : msg.level === "warn" ? "yellow" : "white",
+        textColor: msg.level === "error" ? "red" : msg.level === "warn" ? "yellow" : TEXT_COLOR_DIM,
       },
     ];
   }
@@ -67,9 +69,9 @@ function formatMessage(msg: ServerMessage): UiLine[] {
       },
       ...msg.items.map((item, idx) => ({
         key: `${Date.now()}-${Math.random()}-${idx}`,
-        text: `${item.clipped ? "★ " : ""}[${item.id}] ${item.title} — ${item.snippet}`,
-        dotColor: DOT_DEFAULT,
-        textColor: TEXT_COLOR,
+        text: `${item.clipped ? "★ " : ""}[${item.id}] ${item.title} — ${item.detail}`,
+        dotColor: CLI_BACKGROUND,
+        textColor: TEXT_COLOR_DIM,
       })),
     ];
   }
@@ -155,6 +157,7 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
   const prompt = useMemo(() => {
     return phase === "idle" ? "> " : `${phase}> `;
   }, [phase]);
+  const inputLines = input.split(/\r?\n/);
 
   useInput((chunk, key) => {
     if (key.ctrl && (chunk === "c" || chunk === "\u0003")) {
@@ -177,9 +180,25 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
       return;
     }
 
+    const normalized =
+      typeof chunk === "string"
+        ? chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+        : "";
+
+    const isPasteLike =
+      !key.ctrl &&
+      !key.meta &&
+      normalized.length > 1;
+
+    if (isPasteLike) {
+      setInput((prev) => prev + normalized);
+      return;
+    }
+
     if (key.return) {
       const trimmed = input.trim();
       if (!trimmed) return;
+
       setLines((prev) => [
         ...prev,
         {
@@ -201,14 +220,13 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
       setInput((prev) => prev.slice(0, -1));
       return;
     }
-
     if (key.escape) {
       setInput("");
       return;
     }
 
-    if (!key.ctrl && !key.meta && chunk) {
-      setInput((prev) => prev + chunk);
+    if (!key.ctrl && !key.meta && normalized) {
+      setInput((prev) => prev + normalized);
     }
   });
 
@@ -236,9 +254,18 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
         )}
       </Static>
 
-      <Box>
-        <Text color="gray">{prompt}</Text>
-        <Text>{input}</Text>
+      <Box flexDirection="column">
+        <Box>
+          <Text color="gray">{prompt}</Text>
+          <Text>{inputLines[0] ?? ""}</Text>
+        </Box>
+
+        {inputLines.slice(1).map((line, i) => (
+          <Box key={i}>
+            <Text color="gray">{" ".repeat(prompt.length)}</Text>
+            <Text>{line}</Text>
+          </Box>
+        ))}
       </Box>
 
       <Box marginTop={1}>

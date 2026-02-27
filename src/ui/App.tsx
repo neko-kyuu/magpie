@@ -1,7 +1,7 @@
 import process from "node:process";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Box, Text, useApp, useInput, Static } from "ink";
+import { Box, Text, useApp, useInput, Static, useStdout } from "ink";
 
 import type { BackendClient } from "../ipc/backendClient";
 import type { Item, Permission, PhaseName, ServerMessage } from "../ipc/protocol";
@@ -18,6 +18,7 @@ import {
   wrapSelection,
   type ResultsGroup,
 } from "./focus";
+import { buildViewport, clamp } from "./detail";
 
 type Props = {
   backend: BackendClient;
@@ -161,6 +162,7 @@ function formatMessage(msg: ServerMessage): UiLine[] {
 
 export function App({ backend, workspaceRoot, initialPermission }: Props) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const [phase, setPhase] = useState<PhaseName>("idle");
   const [permission] = useState<Permission>(initialPermission);
   const [input, setInput] = useState("");
@@ -177,6 +179,8 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
   const [webItems, setWebItems] = useState<Item[]>([]);
   const [redditItems, setRedditItems] = useState<Item[]>([]);
   const [clipsItems, setClipsItems] = useState<Item[]>([]);
+  const [detailMode, setDetailMode] = useState(false);
+  const [detailOffset, setDetailOffset] = useState(0);
   const [lines, setLines] = useState<UiLine[]>(() => [
     {
       key: "welcome",
@@ -279,6 +283,19 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
     return Math.max(8, max) + 2;
   }, [groupTabs]);
 
+  const selectedItem = activeItems[selectedIndex] ?? null;
+  const selectedDetailUrl = selectedItem?.url ? String(selectedItem.url) : "";
+  const selectedDetailBody = selectedItem?.detail ?? selectedItem?.snippet ?? "no detail";
+  const detailText = `${selectedDetailUrl || "(no url)"}\n${String(selectedDetailBody || "no detail")}`;
+
+  const termColumns = typeof (stdout as any)?.columns === "number" ? Number((stdout as any).columns) : 80;
+  const termRows = typeof (stdout as any)?.rows === "number" ? Number((stdout as any).rows) : 24;
+  const detailWidth = Math.max(20, termColumns - 6);
+  const detailMaxHeight = clamp(Math.floor(termRows / 3), 4, 12);
+  const detailViewport = useMemo(() => {
+    return buildViewport(detailText, detailWidth, detailMaxHeight, detailOffset);
+  }, [detailText, detailWidth, detailMaxHeight, detailOffset]);
+
   useInput((chunk, key) => {
     if (key.ctrl && (chunk === "c" || chunk === "\u0003")) {
       if (phase !== "idle" && !ctrlCArmedRef.current) {
@@ -318,6 +335,32 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
     }
 
     if (focus === "list") {
+      if (chunk === "o") {
+        setDetailMode((prev) => !prev);
+        setDetailOffset(0);
+        return;
+      }
+
+      if (detailMode) {
+        const page = Math.max(1, detailViewport.height - 1);
+        if (key.ctrl && (chunk === "u" || chunk === "\u0015")) {
+          setDetailOffset((prev) => Math.max(0, prev - page));
+          return;
+        }
+        if (key.ctrl && (chunk === "d" || chunk === "\u0004")) {
+          setDetailOffset((prev) => Math.min(detailViewport.maxOffset, prev + page));
+          return;
+        }
+        if (key.ctrl && key.upArrow) {
+          setDetailOffset((prev) => Math.max(0, prev - 1));
+          return;
+        }
+        if (key.ctrl && key.downArrow) {
+          setDetailOffset((prev) => Math.min(detailViewport.maxOffset, prev + 1));
+          return;
+        }
+      }
+
       if (key.leftArrow) {
         setActiveGroup((prev) => cycleGroup(prev, -1));
         return;
@@ -332,6 +375,7 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
           ...prev,
           [activeGroup]: wrapSelection(prev[activeGroup] ?? 0, -1, len),
         }));
+        setDetailOffset(0);
         return;
       }
       if (key.downArrow) {
@@ -340,6 +384,7 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
           ...prev,
           [activeGroup]: wrapSelection(prev[activeGroup] ?? 0, +1, len),
         }));
+        setDetailOffset(0);
         return;
       }
       return;
@@ -468,11 +513,36 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
               const dotColor = focus === "list" && isSelected ? DOT_SELECTED : DOT_DEFAULT;
               const line = `${item.clipped ? "★ " : ""}[${item.id}] ${item.title}${item.snippet ? ` — ${item.snippet}` : ""}`;
               return (
-                <Box key={item.id} flexDirection="row" alignItems="flex-start">
-                  <Box width={2} flexShrink={0}>
-                    <Text color={dotColor}>●</Text>
+                <Box key={item.id} flexDirection="column">
+                  <Box flexDirection="row" alignItems="flex-start">
+                    <Box width={2} flexShrink={0}>
+                      <Text color={dotColor}>●</Text>
+                    </Box>
+                    <Text color={isSelected ? TEXT_COLOR : TEXT_COLOR_DIM}>{line}</Text>
                   </Box>
-                  <Text color={isSelected ? TEXT_COLOR : TEXT_COLOR_DIM}>{line}</Text>
+
+                  {detailMode && isSelected ? (
+                    <Box flexDirection="column" marginLeft={2} marginTop={1}>
+                      <Box>
+                        <Text color="gray">url: </Text>
+                        <Text color={TEXT_COLOR_DIM}>{selectedDetailUrl || "(no url)"}</Text>
+                      </Box>
+                      <Box flexDirection="column" marginTop={1}>
+                        {detailViewport.lines.map((l, i) => (
+                          <Text key={i} color={TEXT_COLOR_DIM}>
+                            {l || " "}
+                          </Text>
+                        ))}
+                      </Box>
+                      {detailViewport.maxOffset > 0 ? (
+                        <Box marginTop={1}>
+                          <Text color="gray">
+                            scroll {detailViewport.offset + 1}/{detailViewport.maxOffset + 1} (Ctrl+u/d page, Ctrl+↑/↓ line)
+                          </Text>
+                        </Box>
+                      ) : null}
+                    </Box>
+                  ) : null}
                 </Box>
               );
             })

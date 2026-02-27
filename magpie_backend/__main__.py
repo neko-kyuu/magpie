@@ -158,7 +158,7 @@ def _fixture_web_items(query: str) -> list[Dict[str, Any]]:
             "title": "DuckDuckGo Lite: query operators",
             "url": "https://duckduckgo.com/duckduckgo-help-pages/results/syntax/",
             "snippet": f"Example web result for query: {query}",
-            "detail": f"Example web result for query: {query}",
+            "detail": f"Example web result for query: {query}\n\ndemonstrate clipping in the UI. " * 10,
             "source": "fixtures",
             "metadata": {"query": query},
             "clipped": False,

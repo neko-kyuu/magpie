@@ -10,6 +10,7 @@ export type ServerMessage =
   | HelloAckMessage
   | PhaseMessage
   | LogMessage
+  | ItemsMessage
   | DoneMessage
   | ErrorMessage;
 
@@ -75,6 +76,27 @@ export interface LogMessage extends BaseMessage {
   in_reply_to?: string;
 }
 
+export type ItemGroup = "rag" | "web" | "reddit" | "clips";
+
+export interface Item {
+  id: string;
+  group: ItemGroup;
+  title: string;
+  url: string;
+  snippet: string;
+  detail?: string;
+  source: string;
+  metadata?: Record<string, unknown>;
+  clipped?: boolean;
+}
+
+export interface ItemsMessage extends BaseMessage {
+  type: "items";
+  group: ItemGroup;
+  items: Item[];
+  in_reply_to?: string;
+}
+
 export interface DoneMessage extends BaseMessage, WithInReplyTo {
   type: "done";
   ok: boolean;
@@ -87,4 +109,3 @@ export interface ErrorMessage extends BaseMessage {
   recoverable: boolean;
   in_reply_to?: string;
 }
-

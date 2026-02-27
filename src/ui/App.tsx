@@ -1,7 +1,7 @@
 import process from "node:process";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, Text, useApp, useInput, Static } from "ink";
 
 import type { BackendClient } from "../ipc/backendClient";
 import type { Permission, PhaseName, ServerMessage } from "../ipc/protocol";
@@ -15,8 +15,15 @@ type Props = {
 type UiLine = {
   key: string;
   text: string;
-  color?: string;
+  dotColor: string;
+  textColor?: string;
+  userInput?: boolean;
 };
+
+const DOT_DEFAULT = "#2F2F2F";
+const DOT_SUCCESS = "#7B9A77";
+const DOT_ERROR = "#BC7877";
+const TEXT_COLOR = "#000000";
 
 function formatMessage(msg: ServerMessage): UiLine[] {
   if (msg.type === "phase") {
@@ -24,19 +31,46 @@ function formatMessage(msg: ServerMessage): UiLine[] {
       {
         key: `${Date.now()}-${Math.random()}`,
         text: `phase → ${msg.name}`,
-        color: "cyan",
+        dotColor: DOT_DEFAULT,
+        textColor: "cyan",
       },
     ];
   }
   if (msg.type === "log") {
-    const color =
-      msg.level === "error" ? "red" : msg.level === "warn" ? "yellow" : "white";
+    const isError = msg.level === "error" || msg.level === "warn";
     return [
       {
         key: `${Date.now()}-${Math.random()}`,
         text: msg.message,
-        color,
+        dotColor: isError ? DOT_ERROR : DOT_DEFAULT,
+        textColor: msg.level === "error" ? "red" : msg.level === "warn" ? "yellow" : "white",
       },
+    ];
+  }
+  if (msg.type === "items") {
+    if (msg.items.length === 0) {
+      return [
+        {
+          key: `${Date.now()}-${Math.random()}`,
+          text: `${msg.group} items: 0`,
+          dotColor: DOT_DEFAULT,
+          textColor: "gray",
+        },
+      ];
+    }
+    return [
+      {
+        key: `${Date.now()}-${Math.random()}`,
+        text: `${msg.group} items: ${msg.items.length}`,
+        dotColor: DOT_SUCCESS,
+        textColor: "green",
+      },
+      ...msg.items.map((item, idx) => ({
+        key: `${Date.now()}-${Math.random()}-${idx}`,
+        text: `${item.clipped ? "★ " : ""}[${item.id}] ${item.title} — ${item.snippet}`,
+        dotColor: DOT_DEFAULT,
+        textColor: TEXT_COLOR,
+      })),
     ];
   }
   if (msg.type === "done") {
@@ -44,7 +78,8 @@ function formatMessage(msg: ServerMessage): UiLine[] {
       {
         key: `${Date.now()}-${Math.random()}`,
         text: msg.canceled ? "done (canceled)" : msg.ok ? "done (ok)" : "done (failed)",
-        color: msg.ok && !msg.canceled ? "green" : "yellow",
+        dotColor: msg.ok && !msg.canceled ? DOT_SUCCESS : DOT_ERROR,
+        textColor: msg.ok && !msg.canceled ? "green" : "yellow",
       },
     ];
   }
@@ -53,7 +88,8 @@ function formatMessage(msg: ServerMessage): UiLine[] {
       {
         key: `${Date.now()}-${Math.random()}`,
         text: `error: ${msg.message}`,
-        color: "red",
+        dotColor: DOT_ERROR,
+        textColor: "red",
       },
     ];
   }
@@ -62,7 +98,8 @@ function formatMessage(msg: ServerMessage): UiLine[] {
       {
         key: `${Date.now()}-${Math.random()}`,
         text: `backend ready (protocol v${msg.protocol_version})`,
-        color: "green",
+        dotColor: DOT_SUCCESS,
+        textColor: "green",
       },
     ];
   }
@@ -70,7 +107,8 @@ function formatMessage(msg: ServerMessage): UiLine[] {
     {
       key: `${Date.now()}-${Math.random()}`,
       text: JSON.stringify(msg),
-      color: "gray",
+      dotColor: DOT_DEFAULT,
+      textColor: "gray",
     },
   ];
 }
@@ -83,8 +121,9 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
   const [lines, setLines] = useState<UiLine[]>(() => [
     {
       key: "welcome",
-      text: "Magpie CLI (M0) — type a query and press Enter",
-      color: "white",
+      text: "Magpie CLI (M1) - type a query and press Enter",
+      dotColor: DOT_DEFAULT,
+      textColor: TEXT_COLOR,
     },
   ]);
 
@@ -124,7 +163,12 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
         backend.cancel();
         setLines((prev) => [
           ...prev,
-          { key: `${Date.now()}-ctrlc`, text: "cancel requested (Ctrl+C again to exit)", color: "yellow" },
+          {
+            key: `${Date.now()}-ctrlc`,
+            text: "cancel requested (Ctrl+C again to exit)",
+            dotColor: DOT_DEFAULT,
+            textColor: "yellow",
+          },
         ]);
         return;
       }
@@ -138,7 +182,13 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
       if (!trimmed) return;
       setLines((prev) => [
         ...prev,
-        { key: `${Date.now()}-user`, text: `${prompt}${trimmed}`, color: "magenta" },
+        {
+          key: `${Date.now()}-user`,
+          text: `${prompt}${trimmed}`,
+          dotColor: DOT_DEFAULT,
+          textColor: TEXT_COLOR,
+          userInput: true,
+        },
       ]);
       setInput("");
       ctrlCArmedRef.current = false;
@@ -164,13 +214,27 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Box flexDirection="column" marginBottom={1}>
-        {lines.map((l) => (
-          <Text key={l.key} color={l.color}>
-            {l.text}
-          </Text>
-        ))}
-      </Box>
+      <Static items={lines}>
+        {(l) => (
+          <Box
+            key={l.key}
+            flexDirection="row"
+            alignItems="flex-start"
+            marginBottom={1}
+          >
+            <Box width={2} flexShrink={0}>
+              <Text color={l.dotColor}>●</Text>
+            </Box>
+
+            <Text
+              color={l.textColor}
+              backgroundColor={l.userInput ? "#eeeeee" : undefined}
+            >
+              {l.text}
+            </Text>
+          </Box>
+        )}
+      </Static>
 
       <Box>
         <Text color="gray">{prompt}</Text>

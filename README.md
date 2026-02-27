@@ -1,6 +1,6 @@
 # magpie-cli (Demo)
 
-M0 目标：Ink TUI 启动并拉起 Python 后端，通过 stdio JSONL 完成 `hello/hello_ack` 握手，并支持在 TUI 输入后发送 `start`，后端回 `log/phase/done`。
+M1 目标（最小子集）：Ink TUI 启动并拉起 Python 后端，通过 stdio JSONL 完成 `hello/hello_ack` 握手；输入查询后触发 `graphrag_search`（或 fixtures 降级），并在 UI 展示 RAG `items`。
 
 ## 开发运行
 
@@ -36,6 +36,20 @@ MAGPIE_BACKEND_CMD="uv run python3 -m magpie_backend" npm run dev
 
 ```bash
 node scripts/smoke-ipc.js
+```
+
+### 2.6) GraphRAG MCP
+
+本地 MCP GraphRAG server，可通过环境变量接入：
+
+```bash
+MAGPIE_GRAPHRAG_MCP_CMD="python3 /path/to/server.py --config /path/to/config.json" npm run dev
+```
+
+无网/无 MCP 时使用 fixtures：
+
+```bash
+MAGPIE_USE_FIXTURES=1 npm run dev
 ```
 
 ### 3) 构建并运行（bin）

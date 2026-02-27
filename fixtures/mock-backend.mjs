@@ -60,6 +60,22 @@ process.stdin.on("data", (chunk) => {
     if (msg.type === "start") {
       send({ type: "phase", session_id: sessionId, name: "rag", in_reply_to: requestId });
       log(sessionId, "info", `received query: ${String(msg.query || "")}`, requestId);
+      send({
+        type: "items",
+        session_id: sessionId,
+        group: "rag",
+        items: [
+          {
+            id: "rag:1",
+            group: "rag",
+            title: "Mock RAG Item",
+            url: "https://example.com/rag1",
+            snippet: "mock snippet",
+            source: "mock",
+          },
+        ],
+        in_reply_to: requestId,
+      });
       send({ type: "done", session_id: sessionId, in_reply_to: requestId, ok: true, canceled: false });
       send({ type: "phase", session_id: sessionId, name: "idle", in_reply_to: requestId });
       continue;
@@ -79,4 +95,3 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => {
   process.exit(0);
 });
-

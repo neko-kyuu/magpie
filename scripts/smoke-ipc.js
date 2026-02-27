@@ -10,6 +10,10 @@ function send(child, obj) {
 async function main() {
   const child = spawn("python3", ["-m", "magpie_backend"], {
     stdio: ["pipe", "pipe", "inherit"],
+    env: {
+      ...process.env,
+      MAGPIE_USE_FIXTURES: "1",
+    },
   });
 
   let buffer = "";
@@ -53,7 +57,10 @@ async function main() {
     const hasDone = messages.some(
       (m) => m.type === "done" && m.in_reply_to === "r-start"
     );
-    if (hasAck && hasDone) {
+    const hasItems = messages.some(
+      (m) => m.type === "items" && m.group === "rag" && m.in_reply_to === "r-start"
+    );
+    if (hasAck && hasItems && hasDone) {
       child.kill("SIGTERM");
       // eslint-disable-next-line no-console
       console.log("[smoke:ipc] ok");

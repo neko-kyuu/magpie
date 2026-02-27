@@ -96,6 +96,24 @@ test("BackendClient startQuery returns done for that request", async () => {
   });
 });
 
+test("BackendClient receives items for start request", async () => {
+  await withEnv({ MAGPIE_BACKEND_CMD: mockBackendCmd(), MOCK_SEND_INVALID_JSON: undefined }, async () => {
+    const backend = new BackendClient({ workspaceRoot: process.cwd(), permission: "ro" });
+    await backend.start();
+
+    const requestId = backend.startQuery("hello");
+    const items = await waitForMessage(
+      backend,
+      (m) => m && m.type === "items" && m.in_reply_to === requestId
+    );
+    backend.stop();
+
+    assert.equal(items.group, "rag");
+    assert.equal(Array.isArray(items.items), true);
+    assert.equal(items.items[0]?.id, "rag:1");
+  });
+});
+
 test("BackendClient converts backend stderr to warn logs", async () => {
   await withEnv({ MAGPIE_BACKEND_CMD: mockBackendCmd(), MOCK_SEND_INVALID_JSON: undefined }, async () => {
     const backend = new BackendClient({ workspaceRoot: process.cwd(), permission: "ro" });

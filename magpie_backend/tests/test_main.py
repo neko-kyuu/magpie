@@ -12,9 +12,14 @@ from unittest import mock
 from pathlib import Path
 
 from magpie_backend.__main__ import (
+    _DdgLiteParser,
+    _build_reddit_item,
+    _build_web_item,
     _call_graphrag_mcp,
     _extract_graphrag_results,
     _normalize_snippet,
+    _search_reddit_public,
+    _search_web_ddg_lite,
     _safe_float,
     _safe_int,
     run,
@@ -54,7 +59,16 @@ def _patched_stdio(stdin_text: str) -> object:
 def _run_backend(messages: list[dict], env: dict[str, str] | None = None) -> list[dict]:
     stdin = io.StringIO(_lines_to_jsonl(messages))
     stdout = io.StringIO()
-    code = run(stdin, stdout, env or {"MAGPIE_USE_FIXTURES": "0"})
+    code = run(
+        stdin,
+        stdout,
+        env
+        or {
+            "MAGPIE_USE_FIXTURES": "0",
+            "MAGPIE_WEBSEARCH_PROVIDER": "none",
+            "MAGPIE_REDDIT_PROVIDER": "none",
+        },
+    )
     assert code == 0
     return [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
 
@@ -219,6 +233,8 @@ class BackendMainTests(unittest.TestCase):
         self.assertEqual(ack["protocol_version"], 1)
         self.assertEqual(ack["capabilities"]["fixtures"], False)
         self.assertEqual(ack["capabilities"]["mcp_graphrag"], False)
+        self.assertEqual(ack["capabilities"]["web_search"], False)
+        self.assertEqual(ack["capabilities"]["reddit_search"], False)
 
     def test_hello_ack_mcp_capability_true_when_configured(self) -> None:
         out = _run_backend(
@@ -236,6 +252,28 @@ class BackendMainTests(unittest.TestCase):
         )
         ack = next(m for m in out if m.get("type") == "hello_ack")
         self.assertEqual(ack["capabilities"]["mcp_graphrag"], True)
+
+    def test_hello_ack_capabilities_true_when_providers_enabled(self) -> None:
+        out = _run_backend(
+            [
+                {
+                    "type": "hello",
+                    "session_id": "s1",
+                    "request_id": "r1",
+                    "protocol_version": 1,
+                    "workspace_root": "/tmp",
+                    "permission": "ro",
+                }
+            ],
+            env={
+                "MAGPIE_USE_FIXTURES": "0",
+                "MAGPIE_WEBSEARCH_PROVIDER": "ddg",
+                "MAGPIE_REDDIT_PROVIDER": "public",
+            },
+        )
+        ack = next(m for m in out if m.get("type") == "hello_ack")
+        self.assertEqual(ack["capabilities"]["web_search"], True)
+        self.assertEqual(ack["capabilities"]["reddit_search"], True)
 
     def test_start_produces_done(self) -> None:
         out = _run_backend(
@@ -267,7 +305,7 @@ class BackendMainTests(unittest.TestCase):
         self.assertEqual(done["canceled"], False)
 
         phases = [m for m in out if m.get("type") == "phase" and m.get("in_reply_to") == "r2"]
-        self.assertEqual([p.get("name") for p in phases], ["rag", "idle"])
+        self.assertEqual([p.get("name") for p in phases], ["rag", "search", "idle"])
 
     def test_start_with_fixtures_returns_rag_items(self) -> None:
         out = _run_backend(
@@ -296,6 +334,14 @@ class BackendMainTests(unittest.TestCase):
         self.assertGreaterEqual(len(items["items"]), 2)
         self.assertEqual(items["items"][0]["id"], "rag:1")
 
+        web_items = next(m for m in out if m.get("type") == "items" and m.get("group") == "web")
+        self.assertEqual(web_items["in_reply_to"], "r2")
+        self.assertEqual(web_items["items"][0]["id"], "web:1")
+
+        reddit_items = next(m for m in out if m.get("type") == "items" and m.get("group") == "reddit")
+        self.assertEqual(reddit_items["in_reply_to"], "r2")
+        self.assertEqual(reddit_items["items"][0]["id"], "reddit:1")
+
     def test_start_with_mcp_command_returns_rag_items(self) -> None:
         mcp_script = Path(__file__).resolve().parents[2] / "fixtures" / "mock-graphrag-mcp.py"
         out = _run_backend(
@@ -321,6 +367,8 @@ class BackendMainTests(unittest.TestCase):
                 "MAGPIE_USE_FIXTURES": "0",
                 "MAGPIE_SESSION_ID": "s_mcp",
                 "MAGPIE_GRAPHRAG_MCP_CMD": f"python3 {mcp_script}",
+                "MAGPIE_WEBSEARCH_PROVIDER": "none",
+                "MAGPIE_REDDIT_PROVIDER": "none",
             },
         )
         items = next(m for m in out if m.get("type") == "items" and m.get("in_reply_to") == "r2")
@@ -425,6 +473,8 @@ class BackendMainTests(unittest.TestCase):
         ack = next(m for m in out if m.get("type") == "hello_ack")
         self.assertEqual(ack["session_id"], "s_env")
         self.assertEqual(ack["capabilities"]["fixtures"], True)
+        self.assertEqual(ack["capabilities"]["web_search"], True)
+        self.assertEqual(ack["capabilities"]["reddit_search"], True)
 
     def test_blank_lines_are_ignored(self) -> None:
         stdin = io.StringIO("\n\n" + _lines_to_jsonl([{"type": "hello", "session_id": "s1", "request_id": "r1"}]))
@@ -458,6 +508,175 @@ class BackendMainTests(unittest.TestCase):
                 out = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
                 ack = next(m for m in out if m.get("type") == "hello_ack")
                 self.assertEqual(ack["capabilities"]["fixtures"], True)
+
+    def test_build_web_and_reddit_items_include_detail_only_when_present(self) -> None:
+        web = _build_web_item({"title": "t", "url": "u", "snippet": "s"}, 0)
+        self.assertTrue("detail" not in web)
+
+        web_with_detail = _build_web_item({"title": "t", "url": "u", "snippet": "s", "detail": "d"}, 0)
+        self.assertEqual(web_with_detail["detail"], "d")
+
+        reddit = _build_reddit_item({"title": "t", "url": "u", "snippet": "s"}, 0)
+        self.assertTrue("detail" not in reddit)
+
+        reddit_with_detail = _build_reddit_item({"title": "t", "url": "u", "snippet": "s", "detail": "d"}, 0)
+        self.assertEqual(reddit_with_detail["detail"], "d")
+
+    def test_ddg_lite_parser_extracts_title_url_and_snippet(self) -> None:
+        html = (
+            '<a class="result-link" href="https://example.com">Example</a>'
+            '<td class="result-snippet">Snippet here</td>'
+        )
+        parser = _DdgLiteParser()
+        parser.feed(html)
+        self.assertEqual(len(parser.results), 1)
+        self.assertEqual(parser.results[0]["title"], "Example")
+        self.assertEqual(parser.results[0]["url"], "https://example.com")
+        self.assertEqual(parser.results[0]["snippet"], "Snippet here")
+
+    def test_web_and_reddit_search_helpers_success_and_edge_shapes(self) -> None:
+        ddg_html = (
+            '<a class="result-link" href="https://a.example">A</a>'
+            '<td class="result-snippet">A snip</td>'
+            '<a class="result-link" href="https://b.example">B</a>'
+            '<td class="result-snippet">B snip</td>'
+        )
+        reddit_json = json.dumps(
+            {
+                "data": {
+                    "children": [
+                        "bad",
+                        {"data": "bad"},
+                        {"data": {"title": "", "permalink": "/r/x"}},
+                        {"data": {"title": "T1", "permalink": "/r/test/1", "subreddit_name_prefixed": "r/test", "author": "a", "selftext": "body"}},
+                        {"data": {"title": "T2", "permalink": "/r/test/2", "subreddit_name_prefixed": "r/test", "author": "b", "selftext": ""}},
+                    ]
+                }
+            }
+        )
+
+        class FakeHeaders:
+            def __init__(self, charset: str = "utf-8") -> None:
+                self._charset = charset
+
+            def get_content_charset(self) -> str:
+                return self._charset
+
+        class FakeResp:
+            def __init__(self, body: str) -> None:
+                self.headers = FakeHeaders()
+                self._body = body.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "FakeResp":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        def fake_urlopen(req, timeout=None):  # noqa: ANN001
+            url = getattr(req, "full_url", str(req))
+            if "duckduckgo" in url:
+                return FakeResp(ddg_html)
+            if "reddit.com/search.json" in url:
+                return FakeResp(reddit_json)
+            raise AssertionError(f"unexpected url: {url}")
+
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=fake_urlopen):
+            web_items = _search_web_ddg_lite("q", {"MAGPIE_WEB_TOP_K": "1"})
+            self.assertEqual(len(web_items), 1)
+            self.assertEqual(web_items[0]["group"], "web")
+
+            empty_reddit = _search_reddit_public("q", {"MAGPIE_REDDIT_TOP_K": "1", "MAGPIE_SEARCH_TIMEOUT_SEC": "1", "MAGPIE_REDDIT_PROVIDER": "public", "MAGPIE_WEBSEARCH_PROVIDER": "ddg", "MAGPIE_DDG_LITE_URL": "https://lite.duckduckgo.com/lite/" , "MAGPIE_WEB_TOP_K": "5", "MAGPIE_REDDIT_TOP_K": "1"})
+            self.assertEqual(len(empty_reddit), 1)
+            self.assertEqual(empty_reddit[0]["group"], "reddit")
+
+            # children not a list -> []
+            class FakeResp2(FakeResp):
+                pass
+
+            def fake_urlopen_children_bad(req, timeout=None):  # noqa: ANN001
+                return FakeResp2(json.dumps({"data": {"children": "oops"}}))
+
+            with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=fake_urlopen_children_bad):
+                self.assertEqual(_search_reddit_public("q", {"MAGPIE_REDDIT_TOP_K": "5"}), [])
+
+    def test_start_with_providers_sends_web_and_reddit_items_and_handles_errors(self) -> None:
+        class FakeHeaders:
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class FakeResp:
+            def __init__(self, body: str) -> None:
+                self.headers = FakeHeaders()
+                self._body = body.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "FakeResp":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        ddg_html = '<a class="result-link" href="https://example.com">X</a><td class="result-snippet">Y</td>'
+        reddit_json = json.dumps({"data": {"children": [{"data": {"title": "T", "permalink": "/r/t/1", "subreddit_name_prefixed": "r/t", "author": "a", "selftext": ""}}]}})
+
+        def fake_urlopen(req, timeout=None):  # noqa: ANN001
+            url = getattr(req, "full_url", str(req))
+            if "duckduckgo" in url:
+                return FakeResp(ddg_html)
+            if "reddit.com/search.json" in url:
+                return FakeResp(reddit_json)
+            raise AssertionError(f"unexpected url: {url}")
+
+        out = []
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=fake_urlopen):
+            out = _run_backend(
+                [
+                    {"type": "hello", "session_id": "s1", "request_id": "r1", "protocol_version": 1, "workspace_root": "/tmp", "permission": "ro"},
+                    {"type": "start", "session_id": "s1", "request_id": "r2", "query": "q", "workspace_root": "/tmp", "permission": "ro"},
+                ],
+                env={"MAGPIE_USE_FIXTURES": "0", "MAGPIE_WEBSEARCH_PROVIDER": "ddg", "MAGPIE_REDDIT_PROVIDER": "public"},
+            )
+        web_items = next(m for m in out if m.get("type") == "items" and m.get("group") == "web")
+        reddit_items = next(m for m in out if m.get("type") == "items" and m.get("group") == "reddit")
+        self.assertEqual(len(web_items["items"]), 1)
+        self.assertEqual(len(reddit_items["items"]), 1)
+
+        def always_fail(_req, timeout=None):  # noqa: ANN001
+            raise OSError("net down")
+
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=always_fail):
+            out2 = _run_backend(
+                [
+                    {"type": "hello", "session_id": "s1", "request_id": "r1", "protocol_version": 1, "workspace_root": "/tmp", "permission": "ro"},
+                    {"type": "start", "session_id": "s1", "request_id": "r2", "query": "q", "workspace_root": "/tmp", "permission": "ro"},
+                ],
+                env={"MAGPIE_USE_FIXTURES": "0", "MAGPIE_WEBSEARCH_PROVIDER": "ddg", "MAGPIE_REDDIT_PROVIDER": "public"},
+            )
+        warn_logs = [m for m in out2 if m.get("type") == "log" and m.get("level") == "warn"]
+        self.assertTrue(any("web search failed" in str(m.get("message")) for m in warn_logs))
+        self.assertTrue(any("reddit search failed" in str(m.get("message")) for m in warn_logs))
+
+        web_empty = next(m for m in out2 if m.get("type") == "items" and m.get("group") == "web")
+        reddit_empty = next(m for m in out2 if m.get("type") == "items" and m.get("group") == "reddit")
+        self.assertEqual(web_empty["items"], [])
+        self.assertEqual(reddit_empty["items"], [])
+
+        out3 = _run_backend(
+            [
+                {"type": "hello", "session_id": "s1", "request_id": "r1", "protocol_version": 1, "workspace_root": "/tmp", "permission": "ro"},
+                {"type": "start", "session_id": "s1", "request_id": "r2", "query": "q", "workspace_root": "/tmp", "permission": "ro"},
+            ],
+            env={"MAGPIE_USE_FIXTURES": "0", "MAGPIE_WEBSEARCH_PROVIDER": "weird", "MAGPIE_REDDIT_PROVIDER": "weird"},
+        )
+        warn3 = [m for m in out3 if m.get("type") == "log" and m.get("level") == "warn"]
+        self.assertTrue(any("unknown web provider" in str(m.get("message")) for m in warn3))
+        self.assertTrue(any("unknown reddit provider" in str(m.get("message")) for m in warn3))
 
 if __name__ == "__main__":
     unittest.main()

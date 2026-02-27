@@ -27,6 +27,12 @@ const DOT_ERROR = "#BC7877";
 const TEXT_COLOR = "#000000";
 const TEXT_COLOR_DIM = "#9e9b9b";
 
+function normalizeLogMessage(message: string) {
+  if (message.startsWith("stderr: ")) return message.slice("stderr: ".length);
+  if (message.startsWith("stderr:")) return message.slice("stderr:".length).trimStart();
+  return message;
+}
+
 function formatMessage(msg: ServerMessage): UiLine[] {
   if (msg.type === "phase") {
     return [
@@ -43,7 +49,7 @@ function formatMessage(msg: ServerMessage): UiLine[] {
     return [
       {
         key: `${Date.now()}-${Math.random()}`,
-        text: msg.message,
+        text: normalizeLogMessage(msg.message),
         dotColor: isError ? DOT_ERROR : DOT_DEFAULT,
         textColor: msg.level === "error" ? "red" : msg.level === "warn" ? "yellow" : TEXT_COLOR_DIM,
       },
@@ -69,7 +75,7 @@ function formatMessage(msg: ServerMessage): UiLine[] {
       },
       ...msg.items.map((item, idx) => ({
         key: `${Date.now()}-${Math.random()}-${idx}`,
-        text: `${item.clipped ? "★ " : ""}[${item.id}] ${item.title} — ${item.detail}`,
+        text: `${item.clipped ? "★ " : ""}[${item.id}] ${item.title}${item.snippet ? ` — ${item.snippet}` : ""}${item.url ? ` (${item.url})` : ""}`,
         dotColor: CLI_BACKGROUND,
         textColor: TEXT_COLOR_DIM,
       })),
@@ -123,7 +129,7 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
   const [lines, setLines] = useState<UiLine[]>(() => [
     {
       key: "welcome",
-      text: "Magpie CLI (M1) - type a query and press Enter",
+      text: "Magpie CLI (M2) - type a query and press Enter",
       dotColor: DOT_DEFAULT,
       textColor: TEXT_COLOR,
     },

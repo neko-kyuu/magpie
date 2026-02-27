@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "node --import tsx src/cli.tsx",
+    "dev:mcp": "set -a; . ./.env.local; set +a; node --import tsx src/cli.tsx",
     "build": "tsup src/cli.tsx --format esm --platform node --target es2022 --out-dir dist --sourcemap",
     "start": "node bin/magpie.js",
     "smoke:ipc": "node scripts/smoke-ipc.js",

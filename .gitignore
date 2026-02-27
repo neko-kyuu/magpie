@@ -12,6 +12,7 @@ notebooks/
 
 # Environments
 .env
+.env.local
 .envrc
 .venv*
 venv*

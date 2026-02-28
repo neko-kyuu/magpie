@@ -13,11 +13,25 @@ from pathlib import Path
 
 from magpie_backend.__main__ import (
     _DdgLiteParser,
+    _agent_max_attempts,
     _build_reddit_item,
     _build_web_item,
     _call_graphrag_mcp,
+    _coerce_bool,
+    _extract_text_from_openai_chat,
     _extract_graphrag_results,
+    _judge_search_results_openai_compatible,
+    _judge_should_retry,
+    _maybe_rewrite_query,
     _normalize_snippet,
+    _openai_api_key,
+    _openai_base_url,
+    _openai_query_rewrite_model,
+    _openai_search_judge_model,
+    _rewrite_query_fixtures,
+    _rewrite_query_openai_compatible,
+    _search_judge_fixtures,
+    _sanitize_rewrite_text,
     _search_reddit_public,
     _search_web_ddg_lite,
     _safe_float,
@@ -80,6 +94,356 @@ class BackendMainTests(unittest.TestCase):
         normalized = _normalize_snippet("a " * 40, max_chars=20)
         self.assertTrue(normalized.endswith("..."))
         self.assertLessEqual(len(normalized), 20)
+
+    def test_agent_helpers(self) -> None:
+        self.assertEqual(_agent_max_attempts({"MAGPIE_AGENT_MAX_ATTEMPTS": "0"}), 1)
+        self.assertEqual(_agent_max_attempts({"MAGPIE_AGENT_MAX_ATTEMPTS": "3"}), 3)
+
+        self.assertEqual(_openai_api_key({"OPENAI_API_KEY": "k"}), "k")
+        self.assertEqual(_openai_api_key({"MAGPIE_OPENAI_API_KEY": "k2"}), "k2")
+
+        self.assertEqual(_openai_base_url({"MAGPIE_OPENAI_BASE_URL": "http://x/v1/"}), "http://x/v1/")
+        self.assertEqual(_openai_base_url({"OPENAI_BASE_URL": "http://y/v1"}), "http://y/v1")
+
+        self.assertEqual(_openai_query_rewrite_model({"MAGPIE_QUERY_REWRITE_MODEL": "m1"}), "m1")
+        self.assertEqual(_openai_query_rewrite_model({"MAGPIE_OPENAI_MODEL_QUERY_REWRITE": "m2"}), "m2")
+        self.assertEqual(_openai_query_rewrite_model({"MAGPIE_OPENAI_MODEL": "m3"}), "m3")
+        self.assertEqual(_openai_query_rewrite_model({"OPENAI_MODEL": "m4"}), "m4")
+
+        self.assertEqual(_openai_search_judge_model({"MAGPIE_SEARCH_JUDGE_MODEL": "j1"}), "j1")
+        self.assertEqual(_openai_search_judge_model({"MAGPIE_OPENAI_MODEL_SEARCH_JUDGE": "j2"}), "j2")
+        self.assertEqual(_openai_search_judge_model({"MAGPIE_OPENAI_MODEL": "j3"}), "j3")
+        self.assertEqual(_openai_search_judge_model({"OPENAI_MODEL": "j4"}), "j4")
+
+    def test_search_judge_fixtures_retries_until_last_attempt(self) -> None:
+        need1, q2, reason1 = _search_judge_fixtures("q", attempt=1, max_attempts=2)
+        self.assertEqual(need1, True)
+        self.assertTrue(isinstance(q2, str) and q2)
+        self.assertIn("retry", reason1)
+
+        need2, q3, reason2 = _search_judge_fixtures("q", attempt=2, max_attempts=2)
+        self.assertEqual(need2, False)
+        self.assertEqual(q3, None)
+        self.assertIn("max attempts", reason2)
+
+    def test_coerce_bool_accepts_common_inputs(self) -> None:
+        self.assertEqual(_coerce_bool(True), True)
+        self.assertEqual(_coerce_bool(False), False)
+        self.assertEqual(_coerce_bool("true"), True)
+        self.assertEqual(_coerce_bool("YES"), True)
+        self.assertEqual(_coerce_bool("1"), True)
+        self.assertEqual(_coerce_bool("false"), False)
+        self.assertEqual(_coerce_bool("No"), False)
+        self.assertEqual(_coerce_bool("0"), False)
+        self.assertEqual(_coerce_bool("maybe"), None)
+        self.assertEqual(_coerce_bool(1), None)
+
+    def test_judge_search_results_openai_compatible_error_paths(self) -> None:
+        obj, warn = _judge_search_results_openai_compatible("q", [], [], {})
+        self.assertEqual(obj, None)
+        self.assertIn("OPENAI_API_KEY", str(warn))
+
+        web_items = [
+            {"title": "T-long", "snippet": "x" * 220},
+            {"title": "T-only"},
+            {"snippet": "S-only"},
+        ]
+        reddit_items = [{"title": "R", "snippet": "y" * 10}]
+
+        def always_fail(_req, timeout=None):  # noqa: ANN001
+            raise OSError("net down")
+
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=always_fail):
+            obj2, warn2 = _judge_search_results_openai_compatible(
+                "q",
+                web_items,
+                reddit_items,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertEqual(obj2, None)
+            self.assertIn("openai request failed", str(warn2))
+
+    def test_judge_search_results_openai_compatible_parsing_shapes(self) -> None:
+        class FakeHeaders:
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class FakeResp:
+            def __init__(self, body: str) -> None:
+                self.headers = FakeHeaders()
+                self._body = body.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "FakeResp":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        env = {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"}
+
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", return_value=FakeResp("not json")):
+            obj, warn = _judge_search_results_openai_compatible("q", [], [], env)
+            self.assertEqual(obj, None)
+            self.assertIn("response is not json", str(warn))
+
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {}}]})),
+        ):
+            obj2, warn2 = _judge_search_results_openai_compatible("q", [], [], env)
+            self.assertEqual(obj2, None)
+            self.assertIn("missing choices", str(warn2))
+
+        fenced = "```json\n{\"need_retry\": true, \"next_query\": \"q2\", \"reason\": \"r\"}\n```"
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": fenced}}]})),
+        ):
+            obj3, warn3 = _judge_search_results_openai_compatible("q", [], [], env)
+            self.assertEqual(warn3, None)
+            self.assertEqual(obj3.get("need_retry"), True)
+
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "[]"}}]})),
+        ):
+            obj4, warn4 = _judge_search_results_openai_compatible("q", [], [], env)
+            self.assertEqual(obj4, None)
+            self.assertIn("not a json object", str(warn4))
+
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "{not json}"}}]})),
+        ):
+            obj5, warn5 = _judge_search_results_openai_compatible("q", [], [], env)
+            self.assertEqual(obj5, None)
+            self.assertIn("content is not json", str(warn5))
+
+    def test_judge_should_retry_invalid_and_fallback(self) -> None:
+        stdout = io.StringIO()
+        need, next_q, reason = _judge_should_retry(
+            stdout=stdout,
+            session_id="s",
+            request_id="r",
+            attempt=1,
+            max_attempts=2,
+            query="q",
+            web_items=[],
+            reddit_items=[],
+            env={},
+            fixtures=False,
+        )
+        self.assertEqual(need, False)
+        self.assertEqual(next_q, None)
+
+        class FakeHeaders:
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class FakeResp:
+            def __init__(self, body: str) -> None:
+                self.headers = FakeHeaders()
+                self._body = body.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "FakeResp":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        env = {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"}
+        # invalid need_retry -> warn + no retry
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "{\"need_retry\":\"maybe\"}"}}]})),
+        ):
+            need2, next_q2, _ = _judge_should_retry(
+                stdout=stdout,
+                session_id="s",
+                request_id="r",
+                attempt=1,
+                max_attempts=2,
+                query="q",
+                web_items=[],
+                reddit_items=[],
+                env=env,
+                fixtures=False,
+            )
+            self.assertEqual(need2, False)
+            self.assertEqual(next_q2, None)
+
+        # need_retry true but next_query empty -> coerced to no retry
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "{\"need_retry\":true,\"next_query\":\"\"}"}}]})),
+        ):
+            need3, next_q3, _ = _judge_should_retry(
+                stdout=stdout,
+                session_id="s",
+                request_id="r",
+                attempt=1,
+                max_attempts=2,
+                query="q",
+                web_items=[],
+                reddit_items=[],
+                env=env,
+                fixtures=False,
+            )
+            self.assertEqual(need3, False)
+            self.assertEqual(next_q3, None)
+
+        # valid retry path should sanitize next_query
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "{\"need_retry\":true,\"next_query\":\"\\\"q2\\\"\",\"reason\":\"r\"}"}}]})),
+        ):
+            need4, next_q4, reason4 = _judge_should_retry(
+                stdout=stdout,
+                session_id="s",
+                request_id="r",
+                attempt=1,
+                max_attempts=2,
+                query="q",
+                web_items=[],
+                reddit_items=[],
+                env=env,
+                fixtures=False,
+            )
+            self.assertEqual(need4, True)
+            self.assertEqual(next_q4, "q2")
+            self.assertEqual(reason4, "r")
+
+    def test_maybe_rewrite_query_returns_original_when_no_rag_items(self) -> None:
+        stdout = io.StringIO()
+        q = _maybe_rewrite_query(stdout, "s", "r", "user q", [], {}, fixtures=False)
+        self.assertEqual(q, "user q")
+
+    def test_extract_text_from_openai_chat_handles_edge_shapes(self) -> None:
+        self.assertIsNone(_extract_text_from_openai_chat({}))
+        self.assertIsNone(_extract_text_from_openai_chat({"choices": []}))
+        self.assertIsNone(_extract_text_from_openai_chat({"choices": ["bad"]}))
+        self.assertIsNone(_extract_text_from_openai_chat({"choices": [{"message": "bad"}]}))
+        self.assertIsNone(_extract_text_from_openai_chat({"choices": [{"message": {"content": 123}}]}))
+        self.assertEqual(
+            _extract_text_from_openai_chat({"choices": [{"message": {"content": "ok"}}]}),
+            "ok",
+        )
+
+    def test_sanitize_rewrite_text_strips_quotes_codefence_and_newlines(self) -> None:
+        self.assertEqual(_sanitize_rewrite_text('  "hello world"  '), "hello world")
+        fenced = "```text\nrewritten query\n```"
+        self.assertEqual(_sanitize_rewrite_text(fenced), "rewritten query")
+        self.assertEqual(_sanitize_rewrite_text("a\nb\nc"), "a")
+
+    def test_rewrite_query_openai_compatible_error_paths(self) -> None:
+        rag_items = [
+            {"title": "t1", "snippet": "s1"},
+            {"title": "t2"},
+            {"snippet": "s3"},
+            {},
+        ]
+        rewritten, warn = _rewrite_query_openai_compatible("q", rag_items, {})
+        self.assertIsNone(rewritten)
+        self.assertIn("OPENAI_API_KEY", str(warn))
+
+        def always_fail(_req, timeout=None):  # noqa: ANN001
+            raise OSError("net down")
+
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=always_fail):
+            rewritten2, warn2 = _rewrite_query_openai_compatible(
+                "q",
+                rag_items,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertIsNone(rewritten2)
+            self.assertIn("openai request failed", str(warn2))
+
+    def test_rewrite_query_openai_compatible_parsing_and_success(self) -> None:
+        class FakeHeaders:
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class FakeResp:
+            def __init__(self, body: str) -> None:
+                self.headers = FakeHeaders()
+                self._body = body.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "FakeResp":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        rag_items = [
+            {"title": "t1", "snippet": "x" * 300},
+            {"title": "t2"},
+            {"snippet": "s3"},
+            {},
+        ]
+
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", return_value=FakeResp("not json")):
+            rewritten, warn = _rewrite_query_openai_compatible(
+                "q",
+                rag_items,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertIsNone(rewritten)
+            self.assertIn("response is not json", str(warn))
+
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {}}]})),
+        ):
+            rewritten2, warn2 = _rewrite_query_openai_compatible(
+                "q",
+                rag_items,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertIsNone(rewritten2)
+            self.assertIn("missing choices", str(warn2))
+
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "   "}}]})),
+        ):
+            rewritten3, warn3 = _rewrite_query_openai_compatible(
+                "q",
+                rag_items,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertIsNone(rewritten3)
+            self.assertIn("empty rewrite", str(warn3))
+
+        with mock.patch(
+            "magpie_backend.__main__.urllib.request.urlopen",
+            return_value=FakeResp(json.dumps({"choices": [{"message": {"content": "\"rewritten query\"\nextra"}}]})),
+        ):
+            rewritten4, warn4 = _rewrite_query_openai_compatible(
+                "q",
+                rag_items,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertEqual(warn4, None)
+            self.assertEqual(rewritten4, "rewritten query")
+
+        # exercise "(no rag context)" fallback when items are empty-shaped
+        rag_items_empty = [{}, {"title": ""}, {"snippet": ""}]
+        with mock.patch("magpie_backend.__main__.urllib.request.urlopen", side_effect=OSError("x")):
+            _, warn5 = _rewrite_query_openai_compatible(
+                "q",
+                rag_items_empty,
+                {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://example/v1", "OPENAI_MODEL": "m"},
+            )
+            self.assertIn("openai request failed", str(warn5))
 
     def test_extract_graphrag_results_supports_direct_results(self) -> None:
         items = _extract_graphrag_results({"results": [{"title": "x"}]})
@@ -329,18 +693,38 @@ class BackendMainTests(unittest.TestCase):
             ],
             env={"MAGPIE_USE_FIXTURES": "1", "MAGPIE_SESSION_ID": "s_env"},
         )
-        items = next(m for m in out if m.get("type") == "items" and m.get("in_reply_to") == "r2")
+        items = next(m for m in out if m.get("type") == "items" and m.get("group") == "rag" and m.get("in_reply_to") == "r2")
         self.assertEqual(items["group"], "rag")
         self.assertGreaterEqual(len(items["items"]), 2)
         self.assertEqual(items["items"][0]["id"], "rag:1")
 
-        web_items = next(m for m in out if m.get("type") == "items" and m.get("group") == "web")
-        self.assertEqual(web_items["in_reply_to"], "r2")
-        self.assertEqual(web_items["items"][0]["id"], "web:1")
+        agent_rewrite = next(m for m in out if m.get("type") == "log" and "Agent rewrite (1/2)" in str(m.get("message")))
+        self.assertEqual(agent_rewrite.get("tag"), "agent")
+        self.assertEqual(agent_rewrite.get("meta", {}).get("attempt"), 1)
+        self.assertEqual(agent_rewrite.get("meta", {}).get("max_attempts"), 2)
 
-        reddit_items = next(m for m in out if m.get("type") == "items" and m.get("group") == "reddit")
+        judge1 = next(m for m in out if m.get("type") == "log" and "Agent judge (1/2)" in str(m.get("message")))
+        self.assertEqual(judge1.get("tag"), "agent")
+
+        web_msgs = [m for m in out if m.get("type") == "items" and m.get("group") == "web"]
+        self.assertGreaterEqual(len(web_msgs), 1)
+        web_items = web_msgs[-1]
+        self.assertEqual(web_items["in_reply_to"], "r2")
+        self.assertGreaterEqual(len(web_items["items"]), 2)
+        rewritten_query = str(web_items["items"][0]["metadata"]["query"])
+        self.assertIn("refined via RAG", rewritten_query)
+        self.assertEqual(web_items["items"][0]["metadata"]["attempt"], 1)
+        self.assertEqual(web_items["items"][0]["metadata"]["max_attempts"], 2)
+        self.assertEqual(web_items["items"][1]["metadata"]["attempt"], 2)
+
+        reddit_msgs = [m for m in out if m.get("type") == "items" and m.get("group") == "reddit"]
+        self.assertGreaterEqual(len(reddit_msgs), 1)
+        reddit_items = reddit_msgs[-1]
         self.assertEqual(reddit_items["in_reply_to"], "r2")
-        self.assertEqual(reddit_items["items"][0]["id"], "reddit:1")
+        self.assertGreaterEqual(len(reddit_items["items"]), 2)
+        self.assertEqual(str(reddit_items["items"][0]["metadata"]["query"]), rewritten_query)
+        self.assertEqual(reddit_items["items"][0]["metadata"]["attempt"], 1)
+        self.assertEqual(reddit_items["items"][1]["metadata"]["attempt"], 2)
 
     def test_start_with_mcp_command_returns_rag_items(self) -> None:
         mcp_script = Path(__file__).resolve().parents[2] / "fixtures" / "mock-graphrag-mcp.py"
@@ -375,6 +759,34 @@ class BackendMainTests(unittest.TestCase):
         self.assertEqual(items["group"], "rag")
         self.assertEqual(len(items["items"]), 1)
         self.assertEqual(items["items"][0]["title"], "Mock GraphRAG Note")
+
+        warn = next(
+            m
+            for m in out
+            if m.get("type") == "log" and m.get("level") == "warn" and "query rewrite failed" in str(m.get("message"))
+        )
+        self.assertEqual(warn.get("tag"), "agent")
+        self.assertEqual(warn.get("meta", {}).get("attempt"), 1)
+        self.assertEqual(warn.get("meta", {}).get("max_attempts"), 2)
+
+        judge_warn = next(
+            m
+            for m in out
+            if m.get("type") == "log" and m.get("level") == "warn" and "search judge failed" in str(m.get("message"))
+        )
+        self.assertEqual(judge_warn.get("tag"), "agent")
+        self.assertEqual(judge_warn.get("meta", {}).get("attempt"), 1)
+
+    def test_no_rewrite_when_rag_empty(self) -> None:
+        out = _run_backend(
+            [
+                {"type": "hello", "session_id": "s1", "request_id": "r1", "protocol_version": 1, "workspace_root": "/tmp", "permission": "ro"},
+                {"type": "start", "session_id": "s1", "request_id": "r2", "query": "q", "workspace_root": "/tmp", "permission": "ro"},
+            ],
+            env={"MAGPIE_USE_FIXTURES": "0", "MAGPIE_WEBSEARCH_PROVIDER": "none", "MAGPIE_REDDIT_PROVIDER": "none"},
+        )
+        self.assertFalse(any(m.get("type") == "log" and "Agent rewrite:" in str(m.get("message")) for m in out))
+
 
     def test_cancel_produces_done_canceled(self) -> None:
         out = _run_backend(

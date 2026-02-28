@@ -22,6 +22,8 @@ def _log(
     level: str,
     message: str,
     in_reply_to: Optional[str] = None,
+    tag: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload: Dict[str, Any] = {
         "type": "log",
@@ -31,6 +33,10 @@ def _log(
     }
     if in_reply_to is not None:
         payload["in_reply_to"] = in_reply_to
+    if tag is not None:
+        payload["tag"] = tag
+    if meta is not None:
+        payload["meta"] = meta
     _send(stream, payload)
 
 
@@ -286,6 +292,337 @@ def _search_timeout_sec(env: dict[str, str]) -> float:
 
 def _top_k(env: dict[str, str], key: str, default: int = 5) -> int:
     return _safe_int(str(env.get(key) or str(default)), default)
+
+
+def _agent_max_attempts(env: dict[str, str]) -> int:
+    return max(1, _safe_int(str(env.get("MAGPIE_AGENT_MAX_ATTEMPTS") or "2"), 2))
+
+
+def _openai_base_url(env: dict[str, str]) -> str:
+    return str(env.get("MAGPIE_OPENAI_BASE_URL") or env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+
+
+def _openai_api_key(env: dict[str, str]) -> str:
+    return str(env.get("MAGPIE_OPENAI_API_KEY") or env.get("OPENAI_API_KEY") or "").strip()
+
+
+def _openai_query_rewrite_model(env: dict[str, str]) -> str:
+    return str(
+        env.get("MAGPIE_QUERY_REWRITE_MODEL")
+        or env.get("MAGPIE_OPENAI_MODEL_QUERY_REWRITE")
+        or env.get("MAGPIE_OPENAI_MODEL")
+        or env.get("OPENAI_MODEL")
+        or "gpt-5"
+    ).strip()
+
+
+def _extract_text_from_openai_chat(payload: Dict[str, Any]) -> Optional[str]:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    msg = first.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if not isinstance(content, str):
+        return None
+    return content
+
+
+def _sanitize_rewrite_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            cleaned = "\n".join(lines[1:-1]).strip()
+    if "\n" in cleaned:
+        cleaned = cleaned.splitlines()[0].strip()
+    cleaned = cleaned.strip().strip('"').strip("'").strip()
+    return cleaned
+
+
+def _rewrite_query_openai_compatible(
+    user_query: str,
+    rag_items: list[Dict[str, Any]],
+    env: dict[str, str],
+) -> tuple[Optional[str], Optional[str]]:
+    api_key = _openai_api_key(env)
+    if not api_key:
+        return None, "OPENAI_API_KEY is not set"
+
+    base_url = _openai_base_url(env).rstrip("/")
+    model = _openai_query_rewrite_model(env)
+    timeout_sec = _safe_float(str(env.get("MAGPIE_LLM_TIMEOUT_SEC") or "12"), 12.0)
+
+    rag_lines: list[str] = []
+    for item in rag_items[:5]:
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or item.get("detail") or "").strip()
+        if not (title or snippet):
+            continue
+        if snippet and len(snippet) > 200:
+            snippet = snippet[:200] + "..."
+        if title and snippet:
+            rag_lines.append(f"- {title}: {snippet}")
+        elif title:
+            rag_lines.append(f"- {title}")
+        else:
+            rag_lines.append(f"- {snippet}")
+
+    rag_context = "\n".join(rag_lines) if rag_lines else "(no rag context)"
+    system = (
+        "You rewrite web search queries. Output ONLY the rewritten query as plain text. "
+        "No quotes, no markdown, no explanations."
+    )
+    user = (
+        f"Original query:\n{user_query}\n\n"
+        f"Local RAG hints:\n{rag_context}\n\n"
+        "Rewrite the query to be more specific and searchable while preserving intent."
+    )
+
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    url = f"{base_url}/chat/completions"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "magpie-cli/0.0.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # noqa: S310
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read().decode(charset, errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return None, f"openai request failed: {e}"
+
+    try:
+        payload = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return None, f"openai response is not json: {e}"
+
+    content = _extract_text_from_openai_chat(payload)
+    if not content:
+        return None, "openai response missing choices[0].message.content"
+    rewritten = _sanitize_rewrite_text(content)
+    if not rewritten:
+        return None, "openai returned empty rewrite"
+    return rewritten, None
+
+
+def _rewrite_query_fixtures(user_query: str, rag_items: list[Dict[str, Any]]) -> str:
+    hint = ""
+    if rag_items:
+        hint = str(rag_items[0].get("title") or "").strip()
+    hint_part = f" ({hint})" if hint else ""
+    return f"{user_query} refined via RAG{hint_part}"
+
+
+def _search_judge_fixtures(query: str, attempt: int, max_attempts: int) -> tuple[bool, Optional[str], str]:
+    if attempt < max_attempts:
+        return True, f"{query} (retry {attempt + 1})", "fixtures: always retry until last attempt"
+    return False, None, "fixtures: reached max attempts"
+
+
+def _openai_search_judge_model(env: dict[str, str]) -> str:
+    return str(
+        env.get("MAGPIE_SEARCH_JUDGE_MODEL")
+        or env.get("MAGPIE_OPENAI_MODEL_SEARCH_JUDGE")
+        or env.get("MAGPIE_OPENAI_MODEL")
+        or env.get("OPENAI_MODEL")
+        or "gpt-5"
+    ).strip()
+
+
+def _judge_search_results_openai_compatible(
+    query: str,
+    web_items: list[Dict[str, Any]],
+    reddit_items: list[Dict[str, Any]],
+    env: dict[str, str],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    api_key = _openai_api_key(env)
+    if not api_key:
+        return None, "OPENAI_API_KEY is not set"
+
+    base_url = _openai_base_url(env).rstrip("/")
+    model = _openai_search_judge_model(env)
+    timeout_sec = _safe_float(str(env.get("MAGPIE_LLM_TIMEOUT_SEC") or "12"), 12.0)
+
+    def _summarize_items(items: list[Dict[str, Any]], limit: int = 3) -> str:
+        lines: list[str] = []
+        for it in items[:limit]:
+            title = str(it.get("title") or "").strip()
+            snippet = str(it.get("snippet") or "").strip()
+            if snippet and len(snippet) > 180:
+                snippet = snippet[:180] + "..."
+            if title and snippet:
+                lines.append(f"- {title}: {snippet}")
+            elif title:
+                lines.append(f"- {title}")
+            elif snippet:
+                lines.append(f"- {snippet}")
+        return "\n".join(lines) if lines else "(none)"
+
+    system = (
+        "You judge whether to retry web search with a rewritten query. "
+        "Return ONLY a compact JSON object with keys: need_retry (boolean), next_query (string or null), reason (string)."
+    )
+    user = (
+        f"Current query:\n{query}\n\n"
+        f"Web results (top):\n{_summarize_items(web_items)}\n\n"
+        f"Reddit results (top):\n{_summarize_items(reddit_items)}\n\n"
+        "If results look irrelevant/empty, set need_retry=true and propose a better next_query. "
+        "Otherwise need_retry=false and next_query=null."
+    )
+
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.1,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    url = f"{base_url}/chat/completions"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "magpie-cli/0.0.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # noqa: S310
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read().decode(charset, errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return None, f"openai request failed: {e}"
+
+    try:
+        payload = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return None, f"openai response is not json: {e}"
+
+    content = _extract_text_from_openai_chat(payload)
+    if not content:
+        return None, "openai response missing choices[0].message.content"
+
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            text = "\n".join(lines[1:-1]).strip()
+
+    try:
+        obj = json.loads(text)
+    except Exception as e:  # noqa: BLE001
+        return None, f"judge content is not json: {e}"
+
+    if not isinstance(obj, dict):
+        return None, "judge content is not a json object"
+    return obj, None
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1"):
+            return True
+        if v in ("false", "no", "0"):
+            return False
+    return None
+
+
+def _judge_should_retry(
+    stdout: io.TextIOBase,
+    session_id: str,
+    request_id: str,
+    attempt: int,
+    max_attempts: int,
+    query: str,
+    web_items: list[Dict[str, Any]],
+    reddit_items: list[Dict[str, Any]],
+    env: dict[str, str],
+    fixtures: bool,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    meta = {"attempt": attempt, "max_attempts": max_attempts}
+    if fixtures:
+        need_retry, next_query, reason = _search_judge_fixtures(query, attempt, max_attempts)
+        return need_retry, next_query, reason
+
+    obj, warn = _judge_search_results_openai_compatible(query, web_items, reddit_items, env)
+    if warn:
+        _log(stdout, session_id, "warn", f"search judge failed; fallback to no-retry: {warn}", in_reply_to=request_id, tag="agent", meta=meta)
+        return False, None, None
+
+    need_retry = _coerce_bool(obj.get("need_retry")) if isinstance(obj, dict) else None
+    next_query = obj.get("next_query") if isinstance(obj, dict) else None
+    reason = obj.get("reason") if isinstance(obj, dict) else None
+    if need_retry is None:
+        _log(stdout, session_id, "warn", "search judge returned invalid need_retry; fallback to no-retry", in_reply_to=request_id, tag="agent", meta=meta)
+        return False, None, None
+    next_q = None
+    if need_retry:
+        if isinstance(next_query, str) and next_query.strip():
+            next_q = _sanitize_rewrite_text(next_query)
+        if not next_q:
+            need_retry = False
+    return bool(need_retry), next_q, str(reason) if isinstance(reason, str) and reason.strip() else None
+
+
+def _maybe_rewrite_query(
+    stdout: io.TextIOBase,
+    session_id: str,
+    request_id: str,
+    user_query: str,
+    rag_items: list[Dict[str, Any]],
+    env: dict[str, str],
+    fixtures: bool,
+) -> str:
+    if not rag_items:
+        return user_query
+
+    max_attempts = _agent_max_attempts(env)
+    meta = {"attempt": 1, "max_attempts": max_attempts}
+
+    rewritten: Optional[str] = None
+    warn: Optional[str] = None
+    if fixtures:
+        rewritten = _rewrite_query_fixtures(user_query, rag_items)
+    else:
+        rewritten, warn = _rewrite_query_openai_compatible(user_query, rag_items, env)
+
+    if warn:
+        _log(stdout, session_id, "warn", f"query rewrite failed; fallback to original: {warn}", in_reply_to=request_id, tag="agent", meta=meta)
+    final_query = rewritten or user_query
+    _log(stdout, session_id, "info", f'Agent rewrite (1/{max_attempts}): "{final_query}"', in_reply_to=request_id, tag="agent", meta=meta)
+    return final_query
 
 
 class _DdgLiteParser(HTMLParser):
@@ -598,22 +935,90 @@ def run(stdin: io.TextIOBase, stdout: io.TextIOBase, env: dict[str, str]) -> int
                 },
             )
 
+            max_attempts = _agent_max_attempts(env)
+            attempt = 1
+            search_query = query
+            if rag_items:
+                search_query = _maybe_rewrite_query(
+                    stdout=stdout,
+                    session_id=session_id,
+                    request_id=str(request_id),
+                    user_query=query,
+                    rag_items=rag_items,
+                    env=env,
+                    fixtures=fixtures,
+                )
+
             _send(
                 stdout,
                 {"type": "phase", "session_id": session_id, "name": "search", "in_reply_to": request_id},
             )
-            _log(stdout, session_id, "info", f"search query: {query}", in_reply_to=request_id)
+            aggregated_web: list[Dict[str, Any]] = []
+            aggregated_reddit: list[Dict[str, Any]] = []
 
-            if fixtures:
-                web_items = _fixture_web_items(query)
-                reddit_items = _fixture_reddit_items(query)
+            while True:
+                _log(stdout, session_id, "info", f"search query: {search_query}", in_reply_to=request_id)
+
+                web_items: list[Dict[str, Any]] = []
+                reddit_items: list[Dict[str, Any]] = []
+
+                if fixtures:
+                    web_items = _fixture_web_items(search_query)
+                    reddit_items = _fixture_reddit_items(search_query)
+                else:
+                    if web_provider == "ddg":
+                        try:
+                            web_items = _search_web_ddg_lite(search_query, env)
+                        except Exception as e:  # noqa: BLE001
+                            _log(stdout, session_id, "warn", f"web search failed: {e}", in_reply_to=request_id)
+                            web_items = []
+                    elif web_provider != "none":
+                        _log(stdout, session_id, "warn", f"unknown web provider: {web_provider}", in_reply_to=request_id)
+                        web_items = []
+
+                    if reddit_provider == "public":
+                        try:
+                            reddit_items = _search_reddit_public(search_query, env)
+                        except Exception as e:  # noqa: BLE001
+                            _log(stdout, session_id, "warn", f"reddit search failed: {e}", in_reply_to=request_id)
+                            reddit_items = []
+                    elif reddit_provider != "none":
+                        _log(stdout, session_id, "warn", f"unknown reddit provider: {reddit_provider}", in_reply_to=request_id)
+                        reddit_items = []
+
+                for it in web_items:
+                    md = it.get("metadata") if isinstance(it.get("metadata"), dict) else {}
+                    md["attempt"] = attempt
+                    md["max_attempts"] = max_attempts
+                    it["metadata"] = md
+                    it["id"] = f"{it.get('id')}-a{attempt}"
+                for it in reddit_items:
+                    md = it.get("metadata") if isinstance(it.get("metadata"), dict) else {}
+                    md["attempt"] = attempt
+                    md["max_attempts"] = max_attempts
+                    it["metadata"] = md
+                    it["id"] = f"{it.get('id')}-a{attempt}"
+
+                aggregated_web.extend(web_items)
+                aggregated_reddit.extend(reddit_items)
+
+                _log(
+                    stdout,
+                    session_id,
+                    "info",
+                    f"Search ({attempt}/{max_attempts}): web={len(web_items)} reddit={len(reddit_items)} (provider={web_provider},{reddit_provider})",
+                    in_reply_to=request_id,
+                    tag="agent",
+                    meta={"attempt": attempt, "max_attempts": max_attempts},
+                )
+
                 _send(
                     stdout,
                     {
                         "type": "items",
                         "session_id": session_id,
                         "group": "web",
-                        "items": web_items,
+                        "items": aggregated_web,
                         "in_reply_to": request_id,
                     },
                 )
@@ -623,85 +1028,50 @@ def run(stdin: io.TextIOBase, stdout: io.TextIOBase, env: dict[str, str]) -> int
                         "type": "items",
                         "session_id": session_id,
                         "group": "reddit",
-                        "items": reddit_items,
+                        "items": aggregated_reddit,
                         "in_reply_to": request_id,
                     },
                 )
-            else:
-                if web_provider == "ddg":
-                    try:
-                        web_items = _search_web_ddg_lite(query, env)
-                        _send(
-                            stdout,
-                            {
-                                "type": "items",
-                                "session_id": session_id,
-                                "group": "web",
-                                "items": web_items,
-                                "in_reply_to": request_id,
-                            },
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        _log(stdout, session_id, "warn", f"web search failed: {e}", in_reply_to=request_id)
-                        _send(
-                            stdout,
-                            {
-                                "type": "items",
-                                "session_id": session_id,
-                                "group": "web",
-                                "items": [],
-                                "in_reply_to": request_id,
-                            },
-                        )
-                elif web_provider != "none":
-                    _log(stdout, session_id, "warn", f"unknown web provider: {web_provider}", in_reply_to=request_id)
-                    _send(
-                        stdout,
-                        {
-                            "type": "items",
-                            "session_id": session_id,
-                            "group": "web",
-                            "items": [],
-                            "in_reply_to": request_id,
-                        },
-                    )
 
-                if reddit_provider == "public":
-                    try:
-                        reddit_items = _search_reddit_public(query, env)
-                        _send(
-                            stdout,
-                            {
-                                "type": "items",
-                                "session_id": session_id,
-                                "group": "reddit",
-                                "items": reddit_items,
-                                "in_reply_to": request_id,
-                            },
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        _log(stdout, session_id, "warn", f"reddit search failed: {e}", in_reply_to=request_id)
-                        _send(
-                            stdout,
-                            {
-                                "type": "items",
-                                "session_id": session_id,
-                                "group": "reddit",
-                                "items": [],
-                                "in_reply_to": request_id,
-                            },
-                        )
-                elif reddit_provider != "none":
-                    _log(stdout, session_id, "warn", f"unknown reddit provider: {reddit_provider}", in_reply_to=request_id)
-                    _send(
+                if attempt >= max_attempts:
+                    break
+
+                need_retry, next_query, reason = _judge_should_retry(
+                    stdout=stdout,
+                    session_id=session_id,
+                    request_id=str(request_id),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    query=search_query,
+                    web_items=web_items,
+                    reddit_items=reddit_items,
+                    env=env,
+                    fixtures=fixtures,
+                )
+                _log(
+                    stdout,
+                    session_id,
+                    "info",
+                    f"Agent judge ({attempt}/{max_attempts}): retry={'yes' if need_retry else 'no'}{f' (reason={reason})' if reason else ''}",
+                    in_reply_to=request_id,
+                    tag="agent",
+                    meta={"attempt": attempt, "max_attempts": max_attempts},
+                )
+
+                if not need_retry or not next_query:
+                    break
+
+                attempt += 1
+                search_query = next_query
+                if rag_items:
+                    _log(
                         stdout,
-                        {
-                            "type": "items",
-                            "session_id": session_id,
-                            "group": "reddit",
-                            "items": [],
-                            "in_reply_to": request_id,
-                        },
+                        session_id,
+                        "info",
+                        f'Agent rewrite ({attempt}/{max_attempts}): "{search_query}"',
+                        in_reply_to=request_id,
+                        tag="agent",
+                        meta={"attempt": attempt, "max_attempts": max_attempts},
                     )
 
             _send(

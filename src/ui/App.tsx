@@ -190,6 +190,7 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
     },
   ]);
 
+  const [searchAttempt, setSearchAttempt] = useState<{ attempt: number; max: number } | null>(null);
   const ctrlCArmedRef = useRef(false);
   const lastStartRequestId = useRef<string | null>(null);
   const focusRef = useRef(focus);
@@ -239,10 +240,19 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
         }
       }
 
+      if (msg.type === "log" && msg.tag === "agent" && msg.meta && typeof msg.meta === "object") {
+        const attempt = Number((msg.meta as any).attempt);
+        const max = Number((msg.meta as any).max_attempts);
+        if (Number.isFinite(attempt) && attempt > 0 && Number.isFinite(max) && max > 0) {
+          setSearchAttempt({ attempt, max });
+        }
+      }
+
       const formatted = formatMessage(msg);
       setLines((prev) => [...prev, ...formatted].slice(-200));
       if (msg.type === "done" && msg.in_reply_to === lastStartRequestId.current) {
         setPhase("idle");
+        setSearchAttempt(null);
         ctrlCArmedRef.current = false;
       }
     };
@@ -511,7 +521,11 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
             activeItems.map((item, idx) => {
               const isSelected = idx === selectedIndex;
               const dotColor = focus === "list" && isSelected ? DOT_SELECTED : DOT_DEFAULT;
-              const line = `${item.clipped ? "★ " : ""}[${item.id}] ${item.title}${item.snippet ? ` — ${item.snippet}` : ""}`;
+              const attempt = Number((item.metadata as any)?.attempt);
+              const max = Number((item.metadata as any)?.max_attempts);
+              const attemptLabel =
+                Number.isFinite(attempt) && attempt > 0 && Number.isFinite(max) && max > 0 ? ` ${attempt}/${max}` : "";
+              const line = `${item.clipped ? "★ " : ""}[${item.id}${attemptLabel}] ${item.title}${item.snippet ? ` — ${item.snippet}` : ""}`;
               return (
                 <Box key={item.id} flexDirection="column">
                   <Box flexDirection="row" alignItems="flex-start">
@@ -566,7 +580,10 @@ export function App({ backend, workspaceRoot, initialPermission }: Props) {
 
       <Box marginTop={1}>
         <Text color="gray">
-          phase={phase} perm={permission.toUpperCase()} root={workspaceRoot} pid=
+          phase=
+          {phase === "search" && searchAttempt ? `SEARCH ${searchAttempt.attempt}/${searchAttempt.max}` : phase}
+          {" "}
+          perm={permission.toUpperCase()} root={workspaceRoot} pid=
           {process.pid}
         </Text>
       </Box>

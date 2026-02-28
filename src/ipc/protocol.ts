@@ -73,6 +73,8 @@ export interface LogMessage extends BaseMessage {
   type: "log";
   level: "info" | "warn" | "error";
   message: string;
+  tag?: "agent" | "system" | "tool";
+  meta?: Record<string, unknown>;
   in_reply_to?: string;
 }
 
